@@ -12,6 +12,7 @@ venv.bak/
 
 # Arquivos de configuração sensíveis
 config.ini
+teste_conn.py
 
 # Arquivos de saída do projeto
 *.xlsx
