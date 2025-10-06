@@ -6,9 +6,31 @@ from tkinter import filedialog, messagebox, ttk
 import firebirdsql
 from openpyxl import Workbook
 import os
+import configparser
+from typing import Dict, Tuple, Optional, List
+
+# Função para ler configurações do config.ini
+def load_db_config(config_file: str = 'config.ini') -> Dict[str, str]:
+    config = configparser.ConfigParser()
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Arquivo {config_file} não encontrado na pasta do script.")
+    config.read(config_file)
+    if 'Database' not in config:
+        raise KeyError("Seção [Database] não encontrada no arquivo config.ini.")
+    required_keys = ['host', 'database', 'port', 'user', 'password']
+    for key in required_keys:
+        if key not in config['Database']:
+            raise KeyError(f"Chave '{key}' não encontrada na seção [Database] do config.ini.")
+    return {
+        'host': config['Database']['host'],
+        'database': config['Database']['database'],
+        'port': int(config['Database']['port']),
+        'user': config['Database']['user'],
+        'password': config['Database']['password']
+    }
 
 # Função para dividir telefones
-def split_phones(phone_str):
+def split_phones(phone_str: Optional[str]) -> List[str]:
     if pd.isna(phone_str) or not isinstance(phone_str, str) or not phone_str.strip():
         return ['', '', '', '', '', '']
     phones = [p.strip() for p in phone_str.split('|') if p.strip()]
@@ -16,7 +38,7 @@ def split_phones(phone_str):
     return phones[:6]
 
 # Função para criar o DataFrame para o arquivo de base
-def create_base_df(input_df):
+def create_base_df(input_df: pd.DataFrame) -> pd.DataFrame:
     model_columns = [
         'TIPO', 'NR OPERAÇÃO', 'NOME OPERAÇÃO', 'AGENCIA', 'CONTA', 'PRODUTO', 'MODALIDADE',
         'DT. ATUALIZADO', 'DT. VENCIMENTO', 'VALOR OPERAÇÃO', 'VALOR VENCIDO', 'VALOR IOF',
@@ -73,7 +95,7 @@ def create_base_df(input_df):
         output_df['FORMA ATUALIZAÇÃO'] = input_df['ESTABELECIMENTO']
         output_df['OBS. OPERAÇÃO'] = input_df['STATUS']
 
-        def format_date(x):
+        def format_date(x: Optional[datetime.datetime]) -> str:
             if pd.isna(x):
                 return ''
             if isinstance(x, datetime.datetime):
@@ -82,7 +104,7 @@ def create_base_df(input_df):
                 excel_epoch = datetime.date(1899, 12, 30)
                 date_val = excel_epoch + datetime.timedelta(days=int(x))
                 return date_val.strftime('%d/%m/%Y')
-            except:
+            except (ValueError, TypeError):
                 return str(x)
 
         output_df['DT. VENCIMENTO'] = input_df['VENCIMENTO'].apply(format_date)
@@ -109,63 +131,111 @@ def create_base_df(input_df):
     return output_df
 
 # Função para criar o DataFrame para o arquivo de baixa
-def create_baixa_df(df_origem, banco_id):
+def create_baixa_df(df_origem: pd.DataFrame, banco_id: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     try:
+        db_config = load_db_config()
         conn = firebirdsql.connect(
-            host='servidor2',
-            database=r'D:\Dados_interbase\COB_DB_EXECUTIVA_ATHENA_SAUDE.FDB',
-            port=3050,
-            user='consulta',
-            password='@BmpAdm35ConsultaSql#'
+            host=db_config['host'],
+            database=db_config['database'],
+            port=db_config['port'],
+            user=db_config['user'],
+            password=db_config['password']
         )
         cursor = conn.cursor()
-        cursor.execute(f"SELECT NROPERACAO FROM OPERACOES WHERE BANCO = {banco_id} AND STATUS <> 'L'")
-        dados = cursor.fetchall()
-        df_banco = pd.DataFrame(dados, columns=["NROPERACAO"])
+
+        # Passo 1: Consultar NROPERACAO e CLIENTE da tabela OPERACOES
+        cursor.execute(f"SELECT NROPERACAO, CLIENTE FROM OPERACOES WHERE BANCO = {banco_id} AND STATUS <> 'L'")
+        dados_operacoes = cursor.fetchall()
+        df_banco = pd.DataFrame(dados_operacoes, columns=["NROPERACAO", "CLIENTE"])
         df_banco["NROPERACAO"] = df_banco["NROPERACAO"].astype(str)
+        df_banco["CLIENTE"] = df_banco["CLIENTE"].astype(str)
+
+        # Passo 2: Filtrar df_origem para manter apenas operações válidas
+        df_origem = df_origem[df_origem["Documento"].astype(str).isin(df_banco["NROPERACAO"])]
+
+        # Passo 3: Mapeamento das colunas
+        mapeamento = {
+            "Documento": "NR OPERAÇÃO",
+            "Mensalidade (R$)": "VALOR VENCIDO",
+            "Vencimento": "DT. VENCIMENTO",
+            "Pagamento": "DT. PAGAMENTO",
+            "Valor pago (R$)": "VALOR PAGO",
+            "CPF do titular": "CPF / CNPJ",
+            "Titular": "NOME DO CLIENTE",
+        }
+        cols = [c for c in mapeamento if c in df_origem.columns]
+        df_convertido = df_origem[cols].rename(columns={k: mapeamento[k] for k in cols})
+
+        # Passo 4: Formatar datas e valores
+        for c in ["DT. VENCIMENTO", "DT. PAGAMENTO"]:
+            if c in df_convertido:
+                df_convertido[c] = pd.to_datetime(df_convertido[c], errors="coerce").dt.strftime("%d/%m/%Y")
+
+        for c in ["VALOR VENCIDO", "VALOR PAGO"]:
+            if c in df_convertido:
+                df_convertido[c] = pd.to_numeric(df_convertido[c], errors="coerce").map(
+                    lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else ""
+                )
+
+        df_convertido["TIPO"] = "1"
+
+        # Passo 5: Filtrar CPFs/CNPJs com 11 caracteres ou menos
+        original_count = len(df_convertido)
+        df_convertido["CPF / CNPJ"] = df_convertido.get("CPF / CNPJ", "").map(
+            lambda x: str(x).strip() if pd.notna(x) and len(str(x).strip()) > 11 else ""
+        )
+        removed_count = original_count - len(df_convertido[df_convertido["CPF / CNPJ"] != ""])
+
+        # Passo 6: Consultar CNPJs corretos na tabela CLIENTES usando CODIGO em lotes
+        cliente_list = df_banco["CLIENTE"].tolist()
+        cgc_dict = {}
+        if cliente_list:
+            batch_size = 1000  # Tamanho do lote para evitar limite do Firebird
+            for i in range(0, len(cliente_list), batch_size):
+                batch = cliente_list[i:i + batch_size]
+                query = f"SELECT CODIGO, CGC FROM CLIENTES WHERE CODIGO IN ({','.join(['?' for _ in batch])})"
+                cursor.execute(query, batch)
+                dados_clientes = cursor.fetchall()
+                # Garantir que CODIGO seja tratado como string
+                cgc_dict.update({str(row[0]): row[1].strip() if row[1] else '' for row in dados_clientes})
+
+            # Criar dicionário de NROPERACAO para CGC
+            nro_to_cgc = df_banco.merge(
+                pd.DataFrame(list(cgc_dict.items()), columns=['CODIGO', 'CGC']),
+                left_on='CLIENTE',
+                right_on='CODIGO',
+                how='left'
+            )[['NROPERACAO', 'CGC']]
+            nro_to_cgc['CGC'] = nro_to_cgc['CGC'].fillna('')
+            nro_to_cgc = nro_to_cgc.set_index('NROPERACAO')['CGC'].to_dict()
+
+            # Substituir CNPJs no df_convertido
+            corrected_count = 0
+            for idx, row in df_convertido.iterrows():
+                nro = row['NR OPERAÇÃO']
+                cnpj_orig = str(row['CPF / CNPJ']).strip()
+                cnpj_base = nro_to_cgc.get(nro, '')
+                if cnpj_base and cnpj_orig != cnpj_base and cnpj_orig != '':
+                    df_convertido.at[idx, 'CPF / CNPJ'] = cnpj_base
+                    corrected_count += 1
+
         cursor.close()
         conn.close()
+
+        # Passo 7: Exibir mensagem sobre CPFs/CNPJs corrigidos
+        if corrected_count > 0:
+            messagebox.showinfo("Aviso", f"{corrected_count} CNPJs foram corrigidos com base na tabela CLIENTES.")
+
+        return df_convertido, df_origem
+
     except Exception as e:
-        messagebox.showerror("Erro", f"Erro ao conectar ao banco de dados: {e}")
+        messagebox.showerror("Erro", f"Erro ao conectar ao banco de dados ou processar dados: {e}")
+        if 'conn' in locals():
+            conn.close()
         return None, None
 
-    df_origem = df_origem[df_origem["Documento"].astype(str).isin(df_banco["NROPERACAO"])]
-
-    mapeamento = {
-        "Documento": "NR OPERAÇÃO",
-        "Mensalidade (R$)": "VALOR VENCIDO",
-        "Vencimento": "DT. VENCIMENTO",
-        "Pagamento": "DT. PAGAMENTO",
-        "Valor pago (R$)": "VALOR PAGO",
-        "CPF do titular": "CPF / CNPJ",
-        "Titular": "NOME DO CLIENTE",
-    }
-
-    cols = [c for c in mapeamento if c in df_origem.columns]
-    df_convertido = df_origem[cols].rename(columns={k: mapeamento[k] for k in cols})
-
-    for c in ["DT. VENCIMENTO", "DT. PAGAMENTO"]:
-        if c in df_convertido:
-            df_convertido[c] = pd.to_datetime(df_convertido[c], errors="coerce").dt.strftime("%d/%m/%Y")
-
-    for c in ["VALOR VENCIDO", "VALOR PAGO"]:
-        if c in df_convertido:
-            df_convertido[c] = pd.to_numeric(df_convertido[c], errors="coerce").map(
-                lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else ""
-            )
-
-    df_convertido["TIPO"] = "1"
-    # Filtrar CPFs com 11 caracteres ou menos
-    original_count = len(df_convertido)
-    df_convertido["CPF / CNPJ"] = df_convertido.get("CPF / CNPJ", "").map(
-        lambda x: str(x).strip() if pd.notna(x) and len(str(x).strip()) > 11 else ""
-    )
-    removed_count = original_count - len(df_convertido[df_convertido["CPF / CNPJ"] != ""])
-
-    return df_convertido, df_origem
-
 # Função para escrever o arquivo de base
-def write_base_excel(output_file, model_df, company_code, remessa_num, excel_serial):
+def write_base_excel(output_file: str, model_df: pd.DataFrame, company_code: str, remessa_num: str, excel_serial: str) -> None:
     with pd.ExcelWriter(output_file, engine='openpyxl', mode='w') as writer:
         initial_header = pd.DataFrame(
             [['Dt. Remessa', 'Número da Remessa', 'Código da Empresa', 'Código de Evento Ref. A Atualização',
@@ -181,7 +251,7 @@ def write_base_excel(output_file, model_df, company_code, remessa_num, excel_ser
         model_df.to_excel(writer, sheet_name='Modelo_Excel_Incluir_Clientes_I', index=False, header=False, startrow=3)
 
 # Função para escrever o arquivo de baixa
-def write_baixa_excel(output_file, df_convertido, banco_id, data_formatada, remessa):
+def write_baixa_excel(output_file: str, df_convertido: pd.DataFrame, banco_id: int, data_formatada: str, remessa: str) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "BAIXA"
@@ -210,7 +280,7 @@ def write_baixa_excel(output_file, df_convertido, banco_id, data_formatada, reme
     wb.save(output_file)
 
 # Função para gerar o arquivo SQL
-def generate_sql_file(output_sql, df_origem, banco_id):
+def generate_sql_file(output_sql: str, df_origem: pd.DataFrame, banco_id: int) -> None:
     with open(output_sql, "w", encoding="utf-8") as f:
         for _, row in df_origem.iterrows():
             nro = row["Documento"]
@@ -223,13 +293,13 @@ def generate_sql_file(output_sql, df_origem, banco_id):
                         f"UPDATE OPERACOES SET STATUS = 'L' "
                         f"WHERE NROPERACAO = '{nro}' AND DATAVENCTO = '{venc}' AND BANCO = {banco_id};\n"
                     )
-                except Exception as e:
+                except (ValueError, TypeError) as e:
                     # Logar erro, mas continuar processando outros registros
                     print(f"Erro ao formatar data {venc} para NROPERACAO {nro}: {e}")
 
 # Interface gráfica com Layout 2
 class App:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Gerador de Arquivos Base e Baixa")
         self.root.geometry("700x450")
@@ -288,23 +358,23 @@ class App:
         tk.Button(action_frame, text="Gerar Arquivo(s)", command=self.generate_files,
                   font=("Arial", 12), bg="#006400", fg="white").pack()
 
-    def browse_file(self):
+    def browse_file(self) -> None:
         file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
         if file_path:
             self.source_file.set(file_path)
 
-    def browse_directory(self):
+    def browse_directory(self) -> None:
         dir_path = filedialog.askdirectory()
         if dir_path:
             self.output_dir.set(dir_path)
 
-    def toggle_company_selection(self):
+    def toggle_company_selection(self) -> None:
         if self.output_type.get() == "Baixa":
             self.company_combo.config(state="normal")
         else:
             self.company_combo.config(state="disabled")
 
-    def generate_files(self):
+    def generate_files(self) -> None:
         source_file = self.source_file.get()
         output_type = self.output_type.get()
         company = self.company.get()

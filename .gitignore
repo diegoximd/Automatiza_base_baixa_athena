@@ -1,0 +1,34 @@
+# Arquivos e pastas do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Arquivos de configuração sensíveis
+config.ini
+
+# Arquivos de saída do projeto
+*.xlsx
+*.sql
+dist/
+build/
+*.spec
+
+# Arquivos do sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos do IDE
+.idea/
+.vscode/
+
+# Arquivos temporários
+*.log
+*.cache
+*.tmp
