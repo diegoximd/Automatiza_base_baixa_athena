@@ -13,11 +13,11 @@ banco_id = 2002
 
 # === Conexão com o Firebird ===
 conn = firebirdsql.connect(
-    host='servidor2',
-    database=r'D:\Dados_interbase\COB_DB_EXECUTIVA_ATHENA_SAUDE.FDB',
+    host='',
+    database=r'',
     port=3050,
-    user='consulta',
-    password='@BmpAdm35ConsultaSql#'
+    user='',
+    password=''
 )
 
 # Consulta operações válidas no banco (ignora STATUS='L') sem gerar warning
